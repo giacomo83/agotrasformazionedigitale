@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import urllib.parse
 import streamlit as st
@@ -117,6 +118,44 @@ st.markdown("""
         margin-top: 20px;
         margin-bottom: 10px;
     }
+    .dig-card {
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin-top: 10px;
+        margin-bottom: 14px;
+        border: 1px solid #d6eaf8;
+        background-color: #f8fafc;
+    }
+    .dig-pct-ok {
+        color: #1e8449;
+        font-size: 28px;
+        font-weight: 800;
+    }
+    .dig-badge-ok {
+        display: inline-block;
+        background-color: #d4efdf;
+        color: #1e8449;
+        font-weight: 700;
+        font-size: 13px;
+        padding: 3px 10px;
+        border-radius: 12px;
+        margin-left: 8px;
+    }
+    .dig-pct-ko {
+        color: #c0392b;
+        font-size: 28px;
+        font-weight: 800;
+    }
+    .dig-badge-ko {
+        display: inline-block;
+        background-color: #fadbd8;
+        color: #c0392b;
+        font-weight: 700;
+        font-size: 13px;
+        padding: 3px 10px;
+        border-radius: 12px;
+        margin-left: 8px;
+    }
     .referente-box-title {
         font-weight: 700;
         color: #1b4f72;
@@ -167,21 +206,148 @@ def get_image_width_for_height(path: str, target_h: float, fallback_w: float = 3
             pass
     return fallback_w
 
+def fmt_pct(val: float) -> str:
+    return f"{val:.2f}%"
+
+# --- CALCOLO LIVELLO DI DIGITALIZZAZIONE (AS-IS vs TO-BE / POST IMPL.) ---
+SOGLIA_DIGITALIZZAZIONE_OK = 60.00
+
+STOPWORDS_IT = {
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "a", "da", "in",
+    "con", "su", "per", "tra", "fra", "e", "o", "ma", "che", "chi", "cui", "del",
+    "della", "delle", "dei", "degli", "al", "allo", "alla", "ai", "agli", "alle",
+    "dal", "dallo", "dalla", "dai", "dagli", "dalle", "nel", "nello", "nella",
+    "nei", "negli", "nelle", "sul", "sullo", "sulla", "sui", "sugli", "sulle",
+    "non", "piu", "anche", "come", "dove", "quando", "sono", "essere", "viene",
+    "vengono", "stato", "stata", "dati", "processo", "studio", "cliente", "clienti"
+}
+
+NEGAZIONI_IT = {
+    "non", "senza", "nessun", "nessuna", "nessuno", "mai", "manca", "mancante", "assente", "ancora"
+}
+
+KEYWORDS_DIGITALI = {
+    "digitale", "digitalizzato", "digitalizzazione", "elettronica", "elettronico",
+    "automatico", "automatica", "automatizzato", "portale", "app", "cloud",
+    "integrato", "integrata", "integrazione", "firma", "pec", "sdi", "tracciato",
+    "import", "importazione", "riconciliazione", "archivio", "archiviazione",
+    "cassetto", "fiscale", "zucchetti", "ago", "infinity", "zxchange", "zpay",
+    "workflow", "notifiche", "online", "web", "sincronizzato", "centralizzato"
+}
+
+KEYWORDS_MANUALI = {
+    "manuale", "manualmente", "mano", "carta", "cartaceo", "cartacea", "foglio",
+    "fogli", "excel", "word", "email", "mail", "telefono", "telefonate", "whatsapp",
+    "solleciti", "sollecito", "copia", "ricopiatura", "duplicazione", "cartella",
+    "locale", "cartelle", "faldone", "faldoni", "frammentato", "ritardo", "lento", "lenta"
+}
+
+def _parole_ordinate(testo: str) -> list:
+    return re.findall(r"[a-zàèéìòóù]+", testo.lower())
+
+def _tokenizza(testo: str) -> set:
+    return {p for p in _parole_ordinate(testo) if len(p) >= 3 and p not in STOPWORDS_IT}
+
+def _ha_negazione_vicina(parole: list, indice: int) -> bool:
+    finestra = parole[max(0, indice - 3):indice]
+    return any(p in NEGAZIONI_IT for p in finestra)
+
+def calcola_score_processo(as_is: str, to_be: str, post_impl: str) -> float | None:
+    if not as_is or not as_is.strip():
+        return None
+
+    parole = _parole_ordinate(as_is)
+    tokens_asis = _tokenizza(as_is)
+    if not tokens_asis:
+        return 0.0
+
+    tokens_target = _tokenizza(f"{to_be} {post_impl}")
+
+    dig_positivi = 0
+    dig_negati = 0
+    for idx, p in enumerate(parole):
+        if p in KEYWORDS_DIGITALI:
+            if _ha_negazione_vicina(parole, idx):
+                dig_negati += 1
+            else:
+                dig_positivi += 1
+
+    man_count = sum(1 for p in parole if p in KEYWORDS_MANUALI) + dig_negati
+
+    score = 45.0
+    score += min(dig_positivi * 11.0, 35.0)
+    score -= min(man_count * 12.0, 40.0)
+
+    if tokens_target:
+        overlap_ratio = len(tokens_asis & tokens_target) / min(len(tokens_asis), 15)
+        score += min(overlap_ratio * 20.0, 20.0)
+
+    if man_count > 0 and dig_positivi == 0:
+        score = min(score, 35.0)
+
+    return round(max(0.0, min(100.0, score)), 2)
+
+def calcola_digitalizzazione_globale(compiled_phases: list) -> dict:
+    tutti_score = []
+    dettaglio_fasi = []
+    totale_processi = 0
+
+    for fase in compiled_phases:
+        score_fase = []
+        for proc in fase["processi"]:
+            totale_processi += 1
+            s = calcola_score_processo(
+                proc.get("as_is", ""),
+                proc.get("to_be", ""),
+                proc.get("post_impl", "")
+            )
+            if s is not None:
+                score_fase.append(s)
+                tutti_score.append(s)
+
+        media_fase = round(sum(score_fase) / len(score_fase), 2) if score_fase else None
+        esito_fase = None
+        if media_fase is not None:
+            esito_fase = "OK" if media_fase >= SOGLIA_DIGITALIZZAZIONE_OK else "Insufficiente"
+
+        dettaglio_fasi.append({
+            "fase": fase["fase"],
+            "compilati": len(score_fase),
+            "totale": len(fase["processi"]),
+            "media": media_fase,
+            "esito": esito_fase
+        })
+
+    pct_compilati = round(sum(tutti_score) / len(tutti_score), 2) if tutti_score else 0.0
+    pct_su_totale = round(sum(tutti_score) / totale_processi, 2) if totale_processi else 0.0
+    is_ok = pct_compilati >= SOGLIA_DIGITALIZZAZIONE_OK if tutti_score else False
+
+    return {
+        "pct_compilati": pct_compilati,
+        "pct_su_totale": pct_su_totale,
+        "processi_valutati": len(tutti_score),
+        "totale_processi": totale_processi,
+        "is_ok": is_ok,
+        "stato_label": "LIVELLO OK" if is_ok else "LIVELLO INSUFFICIENTE",
+        "soglia": SOGLIA_DIGITALIZZAZIONE_OK,
+        "fasi": dettaglio_fasi
+    }
+
 # --- BARRA LATERALE (ELABORATA PRIMA DELL'INTESTAZIONE) ---
 with st.sidebar:
     st.header("⚙️ Impostazioni Documento")
     studio_nome = st.text_input(
         "Denominazione Studio",
         value="",
-        placeholder="Es. Studio Rossi & Associati"
+        placeholder=""
     )
     versione_doc = st.text_input(
         "Data Documento",
         value="",
-        placeholder="19/11/2026"
+        placeholder=""
     )
     data_presa_visione = st.text_input(
-        "Data Presa Visione (PDF)",
+        "Data Presa Visione",
         value=datetime.now().strftime("%d/%m/%Y")
     )
     consenti_modifica_tobe = st.checkbox(
@@ -203,8 +369,8 @@ HEADER_DATA = {
     "titolo": "PROGETTO DI TRASFORMAZIONE DIGITALE",
     "sottotitolo": f"Analisi dei processi studio professionale: {studio_display}",
     "piattaforma": "Ago Infinity – Zucchetti",
-    "ambito": "Organizzazione dello studio, acquisizione documentale, contabilità, adempimenti fiscali e servizi al cliente",
-    "redatto_da": "Consulente di Transformazione Digitale – Analisi Preliminare",
+    "ambito": "Organizzazione dello studio, acquisizione documentale, contabilità, adempimenti e servizi al cliente",
+    "redatto_da": "Consulenza applicativa – analisi preliminare",
     "versione": versione_display,
     "finalita": "Definire il modello operativo futuro dello studio, individuando per ciascun processo la situazione attuale, il processo obiettivo e il risultato atteso a seguito dell'introduzione o dell'estensione delle funzionalità digitali collegate ad Ago Infinity."
 }
@@ -457,7 +623,7 @@ class ReportPDF(FPDF):
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(2.5)
 
-def genera_pdf(meta_info, compiled_phases, data_firma, studio_raw, referente_info):
+def genera_pdf(meta_info, compiled_phases, data_firma, studio_raw, referente_info, dig_result=None):
     pdf = ReportPDF(studio_header_txt=studio_raw, orientation="P", unit="mm", format="A4")
     pdf.set_margins(10, 10, 10)
     pdf.alias_nb_pages()
@@ -549,10 +715,12 @@ def genera_pdf(meta_info, compiled_phases, data_firma, studio_raw, referente_inf
         pdf.ln(0.8)
 
     pdf.section_title("2. Modello di lettura dell'analisi")
+    pdf.set_font("Helvetica", "", 8.8)
+    pdf.set_text_color(30, 30, 30)
     for riga in SEZIONI_TESTUALI["modello"]:
         pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(usable_w, 4.8, clean_text(riga))
-        pdf.ln(0.8)
+        pdf.multi_cell(usable_w, 4.6, clean_text(riga))
+        pdf.ln(0.6)
 
     # Sezione 3: Tabelle Processi su 190 mm in verticale
     pdf.add_page()
@@ -673,8 +841,137 @@ def genera_pdf(meta_info, compiled_phases, data_firma, studio_raw, referente_inf
         pdf.set_font("Helvetica", "", 8.5)
         pdf.cell(usable_w - 65, 5.5, clean_text(mis), border=1, new_x="LMARGIN", new_y="NEXT")
 
+    pdf.section_title("8. Livello attuale di digitalizzazione (AS-IS vs TO-BE / Post Implementazione)")
+    if dig_result and dig_result.get("processi_valutati", 0) > 0:
+        pct_val = dig_result["pct_compilati"]
+        pct_tot = dig_result["pct_su_totale"]
+        soglia_val = dig_result["soglia"]
+        is_ok = dig_result["is_ok"]
+        stato_txt = "OK" if is_ok else "INSUFFICIENTE"
+
+        badge_w = 52.0
+        desc_w = usable_w - badge_w
+        dettaglio_txt = (
+            f"Valore calcolato: {fmt_pct(pct_val)} ({stato_txt} - soglia {fmt_pct(soglia_val)})\n"
+            f"Copertura su tutti i processi: {fmt_pct(pct_tot)} | "
+            f"Processi AS-IS analizzati: {dig_result['processi_valutati']}/{dig_result['totale_processi']}"
+        )
+
+        pdf.set_font("Helvetica", "", 8.5)
+        desc_lines = pdf.multi_cell(desc_w, 4.5, clean_text(dettaglio_txt), split_only=True)
+        box_h = max(14.0, len(desc_lines) * 4.5 + 3.0)
+
+        if pdf.get_y() + box_h > pdf.h - pdf.b_margin:
+            pdf.add_page()
+
+        y_dig = pdf.get_y()
+        pdf.set_x(pdf.l_margin)
+
+        if is_ok:
+            pdf.set_fill_color(212, 239, 223)
+            pdf.set_draw_color(30, 132, 73)
+            pdf.set_text_color(30, 132, 73)
+        else:
+            pdf.set_fill_color(250, 219, 216)
+            pdf.set_draw_color(192, 57, 43)
+            pdf.set_text_color(192, 57, 43)
+
+        pdf.rect(pdf.l_margin, y_dig, badge_w, box_h, style="DF")
+        pdf.set_font("Helvetica", "B", 9.2)
+        badge_label = f"{fmt_pct(pct_val)}\n{stato_txt}"
+        badge_lines = badge_label.split("\n")
+        badge_ty = y_dig + (box_h - len(badge_lines) * 4.6) / 2.0
+        pdf.set_xy(pdf.l_margin, badge_ty)
+        pdf.multi_cell(badge_w, 4.6, clean_text(badge_label), border=0, align="C")
+
+        pdf.set_fill_color(248, 250, 252)
+        pdf.set_draw_color(180, 195, 210)
+        pdf.set_text_color(30, 30, 30)
+        pdf.rect(pdf.l_margin + badge_w, y_dig, desc_w, box_h, style="DF")
+        desc_ty = y_dig + (box_h - len(desc_lines) * 4.5) / 2.0
+        pdf.set_xy(pdf.l_margin + badge_w + 1.5, desc_ty)
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.multi_cell(desc_w - 3.0, 4.5, clean_text(dettaglio_txt), border=0, align="L")
+
+        pdf.set_xy(pdf.l_margin, y_dig + box_h + 2.5)
+        pdf.set_draw_color(0, 0, 0)
+
+        # Dettaglio per fase nel report PDF
+        f_widths = [118.0, 38.0, 34.0]  # Totale = 190.0 mm
+        f_hdr_h = 6.5
+        if pdf.get_y() + f_hdr_h + 7.0 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "B", 8.0)
+        pdf.set_fill_color(27, 79, 114)
+        pdf.set_draw_color(27, 79, 114)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(f_widths[0], f_hdr_h, "DETTAGLIO PER FASE", border=1, fill=True, align="L")
+        pdf.cell(f_widths[1], f_hdr_h, "COMPILATI", border=1, fill=True, align="C")
+        pdf.cell(f_widths[2], f_hdr_h, "MEDIA / ESITO", border=1, fill=True, align="C", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_draw_color(180, 195, 210)
+        for f_stat in dig_result.get("fasi", []):
+            fase_nome_txt = clean_text(f_stat["fase"])
+            comp_txt = clean_text(f"{f_stat['compilati']} / {f_stat['totale']}")
+            if f_stat["media"] is not None:
+                f_ok = f_stat["media"] >= soglia_val
+                media_txt = clean_text(f"{fmt_pct(f_stat['media'])} ({f_stat['esito']})")
+            else:
+                f_ok = None
+                media_txt = clean_text("N/D")
+
+            pdf.set_font("Helvetica", "", 8.0)
+            f_lines = pdf.multi_cell(f_widths[0] - 3.0, 4.2, fase_nome_txt, split_only=True)
+            f_row_h = max(6.2, len(f_lines) * 4.2 + 1.8)
+
+            if pdf.get_y() + f_row_h > pdf.h - pdf.b_margin:
+                pdf.add_page()
+
+            cy_f = pdf.get_y()
+            cx_f = pdf.l_margin
+
+            pdf.set_fill_color(255, 255, 255)
+            pdf.set_text_color(30, 30, 30)
+            pdf.rect(cx_f, cy_f, f_widths[0], f_row_h, style="DF")
+            pdf.set_xy(cx_f + 1.5, cy_f + (f_row_h - len(f_lines) * 4.2) / 2.0)
+            pdf.set_font("Helvetica", "", 8.0)
+            pdf.multi_cell(f_widths[0] - 3.0, 4.2, fase_nome_txt, border=0, align="L")
+
+            pdf.rect(cx_f + f_widths[0], cy_f, f_widths[1], f_row_h, style="DF")
+            pdf.set_xy(cx_f + f_widths[0], cy_f + (f_row_h - 4.2) / 2.0)
+            pdf.cell(f_widths[1], 4.2, comp_txt, border=0, align="C")
+
+            if f_ok is True:
+                pdf.set_fill_color(212, 239, 223)
+                pdf.set_text_color(30, 132, 73)
+            elif f_ok is False:
+                pdf.set_fill_color(250, 219, 216)
+                pdf.set_text_color(192, 57, 43)
+            else:
+                pdf.set_fill_color(244, 247, 250)
+                pdf.set_text_color(100, 110, 120)
+
+            pdf.rect(cx_f + f_widths[0] + f_widths[1], cy_f, f_widths[2], f_row_h, style="DF")
+            pdf.set_xy(cx_f + f_widths[0] + f_widths[1], cy_f + (f_row_h - 4.2) / 2.0)
+            pdf.set_font("Helvetica", "B", 8.0)
+            pdf.cell(f_widths[2], 4.2, media_txt, border=0, align="C")
+
+            pdf.set_xy(cx_f, cy_f + f_row_h)
+
+        pdf.set_draw_color(0, 0, 0)
+        pdf.ln(1.5)
+    else:
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "I", 8.5)
+        pdf.set_text_color(90, 90, 90)
+        pdf.multi_cell(usable_w, 4.8, clean_text("Livello di digitalizzazione non ancora calcolato o nessun processo AS-IS compilato."))
+        pdf.ln(1)
+
     pdf.section_title("9 - 10. Perimetro di fattibilita ed esito atteso")
     pdf.set_font("Helvetica", "", 8.5)
+    pdf.set_text_color(30, 30, 30)
     for blocco in SEZIONI_TESTUALI["fattibilita_esito"]:
         pdf.set_x(pdf.l_margin)
         pdf.multi_cell(usable_w, 4.6, clean_text(blocco))
@@ -824,9 +1121,53 @@ for f_idx, fase_item in enumerate(PROCESS_DATA):
 
     compiled_phases.append(fase_compilata)
 
-# 3. AVANZAMENTO E GENERAZIONE PDF
+# 3. AVANZAMENTO E CALCOLO LIVELLO DI DIGITALIZZAZIONE
 st.progress(compilati / totale_processi, text=f"Processi AS-IS compilati: {compilati} su {totale_processi}")
 
+if "dig_result" not in st.session_state:
+    st.session_state["dig_result"] = None
+
+st.subheader("📈 Livello Attuale di Digitalizzazione")
+if st.button("Calcola Livello Attuale di Digitalizzazione", type="primary"):
+    calcolato = calcola_digitalizzazione_globale(compiled_phases)
+    if calcolato["processi_valutati"] == 0:
+        st.warning("Compila almeno un campo AS-IS prima di calcolare il livello di digitalizzazione.")
+        st.session_state["dig_result"] = None
+    else:
+        st.session_state["dig_result"] = calcolato
+
+dig_res = st.session_state.get("dig_result")
+if dig_res and dig_res.get("processi_valutati", 0) > 0:
+    pct_class = "dig-pct-ok" if dig_res["is_ok"] else "dig-pct-ko"
+    badge_class = "dig-badge-ok" if dig_res["is_ok"] else "dig-badge-ko"
+    badge_text = "LIVELLO OK" if dig_res["is_ok"] else "LIVELLO INSUFFICIENTE"
+
+    st.markdown(f"""
+    <div class="dig-card">
+        <span class="{pct_class}">{fmt_pct(dig_res['pct_compilati'])}</span>
+        <span class="{badge_class}">{badge_text}</span>
+        <div style="margin-top:6px; font-size:13px; color:#2e4053;">
+            Soglia di riferimento: <strong>{fmt_pct(dig_res['soglia'])}</strong> &bull;
+            Processi AS-IS analizzati: <strong>{dig_res['processi_valutati']}/{dig_res['totale_processi']}</strong> &bull;
+            Copertura complessiva su tutti i processi: <strong>{fmt_pct(dig_res['pct_su_totale'])}</strong>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("Dettaglio per fase"):
+        for f_stat in dig_res["fasi"]:
+            if f_stat["media"] is not None:
+                colore_hex = "#1e8449" if f_stat["media"] >= SOGLIA_DIGITALIZZAZIONE_OK else "#c0392b"
+                st.markdown(
+                    f"• **{f_stat['fase']}**: "
+                    f"<span style='color:{colore_hex}; font-weight:700;'>{fmt_pct(f_stat['media'])} ({f_stat['esito']})</span> "
+                    f"({f_stat['compilati']}/{f_stat['totale']} compilati)",
+                    unsafe_allow_html=True
+                )
+            else:
+                st.write(f"• **{f_stat['fase']}**: *nessun AS-IS compilato* (0/{f_stat['totale']})")
+
+# 4. ESPORTAZIONE REPORT PDF
 st.subheader("📄 Esportazione Report PDF")
 col_btn, col_box = st.columns([1, 2])
 
@@ -872,7 +1213,8 @@ with col_btn:
         compiled_phases,
         data_presa_visione,
         studio_nome.strip(),
-        referente_data
+        referente_data,
+        dig_result=dig_res
     )
     st.download_button(
         label="⬇️ Scarica Report Completo in PDF",
@@ -883,12 +1225,19 @@ with col_btn:
         use_container_width=True
     )
 
+    dig_riga_mail = (
+        f"Livello attuale di digitalizzazione: {fmt_pct(dig_res['pct_compilati'])} ({dig_res['stato_label']})\n"
+        if dig_res and dig_res.get("processi_valutati", 0) > 0
+        else ""
+    )
+
     oggetto_mail = urllib.parse.quote(
         f"Analisi Trasformazione Digitale - {studio_nome.strip() if studio_nome.strip() else 'Studio Professionale'}"
     )
     corpo_mail = urllib.parse.quote(
         f"Buongiorno,\n\n"
         f"in allegato il report di analisi dei processi per lo studio: {studio_nome.strip() or 'N/D'}.\n"
+        f"{dig_riga_mail}"
         f"Referente di Studio: {ref_nome_cognome.strip() or 'N/D'}\n"
         f"Cell: {ref_cell.strip() or 'N/D'}\n"
         f"Email: {ref_email.strip() or 'N/D'}\n"
@@ -896,19 +1245,19 @@ with col_btn:
         f"Cordiali saluti."
     )
     mailto_href = (
-        f"mailto:salvo.lampone@zsicilia.it"
-        f"?cc=giacomo.berte@zsicilia.it"
+        f"mailto:giacomo.berte@zsicilia.it"
+        f"?cc=salvo.lampone@zsicilia.it"
         f"&subject={oggetto_mail}"
         f"&body={corpo_mail}"
     )
 
     st.markdown(f"""
-    <a class="mailto-btn" href="{mailto_href}">invia email a ZSicilia SRL member of ZCS People</a>
+    <a class="mailto-btn" href="{mailto_href}">Invia email a ZSicilia SRL</a>
     <div class="zsicilia-info">
         <strong>ZSICILIA SRL gruppo ZCS People</strong><br>
         Via Sampolo 3D – 90145 Palermo<br>
         P. Iva 07312960821<br>
-        Referente Commerciale: salvo.lampone@zsicilia.it<br>
         Consulente Trasformazione Digitale: giacomo.berte@zsicilia.it
-    </div>
+        Referente Commerciale: salvo.lampone@zsicilia.it<br>
+            </div>
     """, unsafe_allow_html=True)
